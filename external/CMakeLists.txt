@@ -29,6 +29,12 @@ if (TARGET fmt)
 	set_target_properties(fmt PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 endif ()
 add_subdirectory(lsplant/lsplant/src/main/jni)
+if (TARGET lsplant_static)
+	set_target_properties(lsplant_static PROPERTIES CXX_MODULE_STD 0)
+endif ()
+if (TARGET dex_builder_static)
+	set_target_properties(dex_builder_static PROPERTIES CXX_MODULE_STD 0)
+endif ()
 target_compile_options(lsplant_static PUBLIC -Wno-gnu-anonymous-struct
 	# lsplant.cc's `operator""_uarr()` is a string literal operator template, which is a GNU
 	# extension clang warns about under -Wpedantic. Upstream code we do not own, and the

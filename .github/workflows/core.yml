@@ -121,6 +121,10 @@ jobs:
         shell: bash
         run: rm -rf $ANDROID_HOME/cmake
 
+      - name: Disable host C++ standard modules
+        shell: bash
+        run: sudo rm -f /usr/include/c++/*/bits/std.cc /usr/include/c++/*/bits/std.compat.cc 2>/dev/null || true
+
       - name: Build with Gradle
         run: |
           ./gradlew zipAll
