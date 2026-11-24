@@ -141,6 +141,23 @@ object ManagerService : IManagerService.Stub() {
   private fun getManagerIntent(): Intent? {
     if (managerIntent != null) return managerIntent
     runCatching {
+          // If the standalone manager app is installed, open it directly!
+          val standaloneIntent =
+              Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                setPackage(BuildConfig.DEFAULT_MANAGER_PACKAGE_NAME)
+              }
+          val standaloneRis =
+              packageManager?.queryIntentActivitiesCompat(
+                  standaloneIntent, standaloneIntent.type, 0, 0)
+          if (!standaloneRis.isNullOrEmpty()) {
+            val activity = standaloneRis.first().activityInfo
+            standaloneIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            standaloneIntent.component = ComponentName(activity.packageName, activity.name)
+            managerIntent = standaloneIntent
+            return managerIntent
+          }
+
           var intent =
               Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_INFO)

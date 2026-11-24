@@ -62,28 +62,34 @@ object ParasiticManagerHooker {
                     val ctx: Context = ActivityThread.currentActivityThread().systemContext
                     var sourcePath = "/proc/self/fd/$managerFd"
 
-                    // SDK <= 28 (Android 9) cannot reliably parse APKs via FD paths in all
-                    // contexts.
-                    // We copy the APK to the host's cache as a workaround.
-                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                        // The pre-rename name, removed so an upgraded host is not left carrying a
-                        // stale copy of the manager in its cache forever.
-                        runCatching { File("${appInfo.dataDir}/cache/lsposed.apk").delete() }
-                        val dstPath = "${appInfo.dataDir}/cache/vector-manager.apk"
-                        runCatching {
-                                FileInputStream(sourcePath).use { input ->
-                                    FileOutputStream(dstPath).use { output ->
-                                        input.channel.transferTo(
-                                            0,
-                                            input.channel.size(),
-                                            output.channel,
-                                        )
-                                    }
+                    // Always copy the manager APK to host cache.
+                    // Parsing /proc/self/fd fails in modern Android (especially 15/16) due to
+                    // PackageManager path validation restrictions, and AssetManager cannot load resources from fd paths.
+                    runCatching { File("${appInfo.dataDir}/cache/lsposed.apk").delete() }
+                    val cacheDir = File(appInfo.dataDir, "cache")
+                    if (!cacheDir.exists()) cacheDir.mkdirs()
+                    val dstFile = File(cacheDir, "vector-manager.apk")
+                    runCatching {
+                        val input =
+                            runCatching { FileInputStream(sourcePath) }
+                                .getOrElse {
+                                    val pfd = ParcelFileDescriptor.fromFd(managerFd)
+                                    FileInputStream(pfd.fileDescriptor)
                                 }
-                                sourcePath = dstPath
+                        input.use { inStream ->
+                            FileOutputStream(dstFile).use { outStream ->
+                                inStream.channel.transferTo(
+                                    0,
+                                    inStream.channel.size(),
+                                    outStream.channel,
+                                )
                             }
-                            .onFailure { logE("Failed to copy parasitic APK", it) }
-                    }
+                        }
+                        dstFile.setReadable(true, false)
+                        if (dstFile.exists() && dstFile.length() > 0) {
+                            sourcePath = dstFile.absolutePath
+                        }
+                    }.onFailure { logE("Failed to copy parasitic APK", it) }
 
                     val pkgInfo =
                         ctx.packageManager.getPackageArchiveInfo(
@@ -213,15 +219,13 @@ object ParasiticManagerHooker {
                         val pathClassLoader = param.result as ClassLoader
 
                         logD("Injecting DEX into LoadedApk ClassLoader: $pathClassLoader")
-                        val pathList = XposedHelpers.getObjectField(pathClassLoader, "pathList")
-                        val dexPaths = XposedHelpers.callMethod(pathList, "getDexPaths") as List<*>
-
-                        if (!dexPaths.contains(dexPath)) {
-                            Utils.logW("Manager APK not found in ClassLoader, adding manually...")
+                        runCatching {
                             XposedHelpers.callMethod(pathClassLoader, "addDexPath", dexPath)
+                        }.onFailure { t ->
+                            logE("Failed to addDexPath on ClassLoader", t)
                         }
                         sendBinderToManager(pathClassLoader, managerService.asBinder())
-                        classLoaderUnhook!!.unhook() // Only need to inject once
+                        classLoaderUnhook?.unhook() // Only need to inject once
                     }
                 }
             }
@@ -241,10 +245,9 @@ object ParasiticManagerHooker {
         val activityHooker =
             object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam<*>) {
+                    val pkgInfo = getManagerPkgInfo(null)
                     param.args.forEachIndexed { i, arg ->
-                        if (arg is ActivityInfo) {
-                            val pkgInfo =
-                                getManagerPkgInfo(arg.applicationInfo) ?: return@forEachIndexed
+                        if (arg is ActivityInfo && pkgInfo != null) {
                             pkgInfo.activities
                                 ?.find {
                                     it.name == BuildConfig.ManagerPackageName + ".ui.MainActivity"
@@ -254,10 +257,14 @@ object ParasiticManagerHooker {
                                     param.args[i] = it
                                 }
                         }
-                        if (arg is Intent) {
+                        if (arg is Intent && pkgInfo != null) {
+                            val pkg =
+                                arg.component?.packageName
+                                    ?: arg.`package`
+                                    ?: BuildConfig.InjectedPackageName
                             arg.component =
                                 ComponentName(
-                                    arg.component!!.packageName,
+                                    pkg,
                                     BuildConfig.ManagerPackageName + ".ui.MainActivity",
                                 )
                         }
@@ -285,16 +292,18 @@ object ParasiticManagerHooker {
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam<*>) {
-                    if (!activityClientRecordClass.isInstance(param.thisObject)) return
-                    param.args.filterIsInstance<ActivityInfo>().forEach { aInfo ->
-                        logD("Restoring state for Activity: ${aInfo.name}")
-                        states[aInfo.name]?.let {
-                            XposedHelpers.setObjectField(param.thisObject, "state", it)
+                    runCatching {
+                        if (!activityClientRecordClass.isInstance(param.thisObject)) return
+                        param.args.filterIsInstance<ActivityInfo>().forEach { aInfo ->
+                            logD("Restoring state for Activity: ${aInfo.name}")
+                            states[aInfo.name]?.let {
+                                XposedHelpers.setObjectField(param.thisObject, "state", it)
+                            }
+                            persistentStates[aInfo.name]?.let {
+                                XposedHelpers.setObjectField(param.thisObject, "persistentState", it)
+                            }
                         }
-                        persistentStates[aInfo.name]?.let {
-                            XposedHelpers.setObjectField(param.thisObject, "persistentState", it)
-                        }
-                    }
+                    }.onFailure { logE("Failed to restore activity state", it) }
                 }
             }
 
@@ -381,48 +390,50 @@ object ParasiticManagerHooker {
         )
 
         // Hook 6: WebView initialization within Parasitic process
-        XposedHelpers.findAndHookMethod(
-            WebViewFactory::class.java,
-            "getProvider",
-            object : XC_MethodReplacement() {
-                override fun replaceHookedMethod(param: MethodHookParam<*>): Any? {
-                    val existing =
-                        XposedHelpers.getStaticObjectField(
-                            WebViewFactory::class.java,
-                            "sProviderInstance",
-                        )
-                    if (existing != null) return existing
-
-                    val providerClass =
-                        XposedHelpers.callStaticMethod(
-                            WebViewFactory::class.java,
-                            "getProviderClass",
-                        ) as Class<*>
-                    return try {
-                        val staticFactory =
-                            providerClass.getMethod(
-                                CHROMIUM_WEBVIEW_FACTORY_METHOD,
-                                WebViewDelegate::class.java,
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                WebViewFactory::class.java,
+                "getProvider",
+                object : XC_MethodReplacement() {
+                    override fun replaceHookedMethod(param: MethodHookParam<*>): Any? {
+                        val existing =
+                            XposedHelpers.getStaticObjectField(
+                                WebViewFactory::class.java,
+                                "sProviderInstance",
                             )
-                        val delegateCtor =
-                            WebViewDelegate::class.java.getDeclaredConstructor().apply {
-                                isAccessible = true
-                            }
-                        val instance = staticFactory.invoke(null, delegateCtor.newInstance())
-                        XposedHelpers.setStaticObjectField(
-                            WebViewFactory::class.java,
-                            "sProviderInstance",
-                            instance,
-                        )
-                        logD("WebView provider initialized: $instance")
-                        instance
-                    } catch (e: Exception) {
-                        logE("WebView initialization failed", e)
-                        throw AndroidRuntimeException(e)
+                        if (existing != null) return existing
+
+                        val providerClass =
+                            XposedHelpers.callStaticMethod(
+                                WebViewFactory::class.java,
+                                "getProviderClass",
+                            ) as Class<*>
+                        return try {
+                            val staticFactory =
+                                providerClass.getMethod(
+                                    CHROMIUM_WEBVIEW_FACTORY_METHOD,
+                                    WebViewDelegate::class.java,
+                                )
+                            val delegateCtor =
+                                WebViewDelegate::class.java.getDeclaredConstructor().apply {
+                                    isAccessible = true
+                                }
+                            val instance = staticFactory.invoke(null, delegateCtor.newInstance())
+                            XposedHelpers.setStaticObjectField(
+                                WebViewFactory::class.java,
+                                "sProviderInstance",
+                                instance,
+                            )
+                            logD("WebView provider initialized: $instance")
+                            instance
+                        } catch (e: Exception) {
+                            logE("WebView initialization failed", e)
+                            throw AndroidRuntimeException(e)
+                        }
                     }
-                }
-            },
-        )
+                },
+            )
+        }.onFailure { logE("Failed to hook WebViewFactory", it) }
 
         // Hook 7: State Capture on Stop
         val stateCaptureHooker =
