@@ -135,7 +135,12 @@ object ConfigCache {
 
   fun isManager(uid: Int): Boolean {
     ensureCacheReady()
-    return uid == state.managerUid || uid == BuildConfig.MANAGER_INJECTED_UID
+    if (uid == state.managerUid || uid == BuildConfig.MANAGER_INJECTED_UID) return true
+    if (state.managerUid == -1 && packageManager != null) {
+      updateManager(false)
+      if (uid == state.managerUid) return true
+    }
+    return false
   }
 
   fun requestCacheUpdate() {

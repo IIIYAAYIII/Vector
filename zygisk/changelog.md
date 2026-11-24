@@ -1,3 +1,8 @@
+### 🛡️ Android 16 & Standalone Manager Hotfix
+*   📱 **Support Standalone Manager APK (`org.matrix.vector.manager`).** Fixed Zygisk injection bypass for user-installed manager applications (UID > 10000), preventing premature dlclose of the module library.
+*   🛡️ **Guard against NULL pointer dereferences in `preAppSpecialize`.** Prevent native SIGSEGV crashes caused by `strlen(NULL)` when handling system processes without `nice_name` or null `gids`.
+*   ⚡ **Robust Service & Namespace Launch.** Added KernelSU/APatch busybox unshare fallback in `service.sh` and lazy manager UID resolution in `ConfigCache`.
+
 Vector 2.2 is a hotfix for 2.1, and it brings libxposed API 102 — where a module can be swapped out without taking the process down with it.
 
 > [!IMPORTANT]

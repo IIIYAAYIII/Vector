@@ -482,34 +482,35 @@ object ParasiticManagerHooker {
             // Asked first: a process the daemon did not launch the manager into gets null here,
             // and there is no point opening the APK for it.
             val managerBinder = VectorServiceClient.requestManagerService() ?: return false
-            VectorServiceClient.openManagerApk()!!.use { pfd ->
-                val managerService = IManagerService.Stub.asInterface(managerBinder)
+            val managerService = IManagerService.Stub.asInterface(managerBinder)
 
-                if (isParasitic) {
-                    managerFd = pfd.detachFd()
-                    hookForManager(managerService)
-                } else {
-                    XposedHelpers.findAndHookMethod(
-                        LoadedApk::class.java,
-                        "getClassLoader",
-                        object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam<*>) {
-                                val mAppInfo =
-                                    XposedHelpers.getObjectField(
-                                        param.thisObject,
-                                        "mApplicationInfo",
-                                    ) as ApplicationInfo
-                                if (mAppInfo.packageName == BuildConfig.ManagerPackageName) {
-                                    val classLoader = param.result as ClassLoader
-                                    sendBinderToManager(classLoader, managerService.asBinder())
-                                }
+            if (isParasitic) {
+                val pfd =
+                    VectorServiceClient.openManagerApk()
+                        ?: throw IllegalStateException("Cannot open manager APK for parasitic manager")
+                pfd.use { managerFd = it.detachFd() }
+                hookForManager(managerService)
+            } else {
+                XposedHelpers.findAndHookMethod(
+                    LoadedApk::class.java,
+                    "getClassLoader",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam<*>) {
+                            val mAppInfo =
+                                XposedHelpers.getObjectField(
+                                    param.thisObject,
+                                    "mApplicationInfo",
+                                ) as ApplicationInfo
+                            if (mAppInfo.packageName == BuildConfig.ManagerPackageName) {
+                                val classLoader = param.result as ClassLoader
+                                sendBinderToManager(classLoader, managerService.asBinder())
                             }
-                        },
-                    )
-                }
-                Utils.logD("Vector manager injected successfully into process.")
-                true
+                        }
+                    },
+                )
             }
+            Utils.logD("Vector manager injected successfully into process.")
+            true
         } catch (e: Throwable) {
             Utils.logE("Parasitic injection failed", e)
             false

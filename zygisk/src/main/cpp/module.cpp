@@ -8,6 +8,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <string_view>
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
@@ -235,65 +236,77 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     should_inject_ = false;
     is_manager_app_ = false;
 
-    // --- Manager App Special Handling ---
-    // We identify our manager app by a special UID and
-    // grant it internet permissions by adding it to the INET group.
-    if (args->uid == kHostPackageUid) {
-        lsplant::JUTFString nice_name_str(env_, args->nice_name);
-        if (nice_name_str.get() == std::string(kManagerPackageName)) {
-            LOGI("Manager app detected. Granting internet permissions.");
-            is_manager_app_ = true;
-
-            // Add GID_INET to the GID list.
-            int original_gids_count = env_->GetArrayLength(args->gids);
-            jintArray new_gids = env_->NewIntArray(original_gids_count + 1);
-            if (env_->ExceptionCheck()) {
-                LOGE("Failed to create new GID array for manager.");
-                env_->ExceptionClear();  // Clear exception to prevent a crash.
-                return;
-            }
-
-            jint *gids_array = env_->GetIntArrayElements(args->gids, nullptr);
-            env_->SetIntArrayRegion(new_gids, 0, original_gids_count, gids_array);
-            env_->ReleaseIntArrayElements(args->gids, gids_array, JNI_ABORT);
-
-            jint inet_gid = GID_INET;
-            env_->SetIntArrayRegion(new_gids, original_gids_count, 1, &inet_gid);
-
-            // The new array is only seen by the native specialization, which calls setgroups().
-            // Once it returns, Zygote#forkAndSpecialize keeps using the array it passed in:
-            //
-            //   NetworkUtils.setAllowNetworkingForProcess(containsInetGid(gids));
-            //
-            // That flag lives in libnetd_client and gates the whole process: without it,
-            // socket() and dns_open_proxy() fail with EPERM no matter which groups we really
-            // belong to. So overwrite the first entry of the original array as well, to make
-            // containsInetGid() see the INET group. Dropping this slot is harmless: the array
-            // has no further use once specialization is done.
-            if (original_gids_count > 0) {
-                env_->SetIntArrayRegion(args->gids, 0, 1, &inet_gid);
-            }
-
-            args->nice_name = env_->NewStringUTF(INJECTED_PACKAGE_NAME);
-            args->gids = new_gids;
-        }
+    if (!args || !args->nice_name) {
+        return;
     }
 
-    IPCBridge::GetInstance().Initialize(env_);
-
-    // --- Injection Decision Logic ---
-    // Determine if the current process is a valid target for injection.
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
+    const char *nice_name_cstr = nice_name_str.get();
+    if (!nice_name_cstr) {
+        return;
+    }
 
+    // --- Manager App Special Handling ---
+    // Identify manager app either as parasitic manager (host UID 2000) or standalone manager APK.
+    if (std::string_view(nice_name_cstr) == kManagerPackageName) {
+        is_manager_app_ = true;
+        should_inject_ = true;
+
+        if (args->uid == kHostPackageUid) {
+            LOGI("Manager app (parasitic) detected. Granting internet permissions.");
+            // Add GID_INET to the GID list if gids is valid.
+            if (args->gids != nullptr) {
+                int original_gids_count = env_->GetArrayLength(args->gids);
+                jintArray new_gids = env_->NewIntArray(original_gids_count + 1);
+                if (env_->ExceptionCheck()) {
+                    LOGE("Failed to create new GID array for manager.");
+                    env_->ExceptionClear();  // Clear exception to prevent a crash.
+                } else {
+                    jint *gids_array = env_->GetIntArrayElements(args->gids, nullptr);
+                    if (gids_array != nullptr) {
+                        env_->SetIntArrayRegion(new_gids, 0, original_gids_count, gids_array);
+                        env_->ReleaseIntArrayElements(args->gids, gids_array, JNI_ABORT);
+
+                        jint inet_gid = GID_INET;
+                        env_->SetIntArrayRegion(new_gids, original_gids_count, 1, &inet_gid);
+
+                        // The new array is only seen by the native specialization, which calls setgroups().
+                        // Once it returns, Zygote#forkAndSpecialize keeps using the array it passed in:
+                        //
+                        //   NetworkUtils.setAllowNetworkingForProcess(containsInetGid(gids));
+                        //
+                        // That flag lives in libnetd_client and gates the whole process: without it,
+                        // socket() and dns_open_proxy() fail with EPERM no matter which groups we really
+                        // belong to. So overwrite the first entry of the original array as well, to make
+                        // containsInetGid() see the INET group. Dropping this slot is harmless: the array
+                        // has no further use once specialization is done.
+                        if (original_gids_count > 0) {
+                            env_->SetIntArrayRegion(args->gids, 0, 1, &inet_gid);
+                        }
+
+                        args->gids = new_gids;
+                    }
+                }
+            }
+            args->nice_name = env_->NewStringUTF(INJECTED_PACKAGE_NAME);
+        } else {
+            LOGI("Manager app (standalone APK, UID: {}) detected.", args->uid);
+        }
+
+        // Manager process is explicitly marked for injection; bypass app_data_dir/isolated checks.
+        return;
+    }
+
+    // --- Injection Decision Logic for Regular Apps ---
     // An app without a data directory cannot be a target.
     if (!args->app_data_dir) {
-        LOGD("Skipping injection for '{}': no app_data_dir.", nice_name_str.get());
+        LOGD("Skipping injection for '{}': no app_data_dir.", nice_name_cstr);
         return;
     }
 
     // Child Zygotes are specialized zygotes for apps like WebView and are not targets.
     if (args->is_child_zygote && *args->is_child_zygote) {
-        LOGD("Skipping injection for '{}': is a child zygote.", nice_name_str.get());
+        LOGD("Skipping injection for '{}': is a child zygote.", nice_name_cstr);
         return;
     }
 
@@ -302,36 +315,45 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     if ((app_id >= FIRST_ISOLATED_UID && app_id <= LAST_ISOLATED_UID) ||
         (app_id >= FIRST_APP_ZYGOTE_ISOLATED_UID && app_id <= LAST_APP_ZYGOTE_ISOLATED_UID) ||
         app_id == SHARED_RELRO_UID) {
-        LOGV("Skipping injection for '{}': is an isolated process (UID: {}).", nice_name_str.get(),
+        LOGV("Skipping injection for '{}': is an isolated process (UID: {}).", nice_name_cstr,
              app_id);
         return;
     }
 
     // If we passed all checks, mark this process for injection.
     should_inject_ = true;
-    LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
+    LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_cstr, args->uid);
 }
 
 void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
-    if (!should_inject_) {
+    if (!should_inject_ || !args || !args->nice_name) {
         SetAllowUnload(true);  // Not a target, allow module to be unloaded.
         return;
     }
 
-    if (is_manager_app_) {
+    // If this was a parasitic manager, args->nice_name was changed to INJECTED_PACKAGE_NAME
+    // in preAppSpecialize, so restore it back to kManagerPackageName.
+    if (is_manager_app_ && args->uid == kHostPackageUid) {
         args->nice_name = env_->NewStringUTF(kManagerPackageName);
     }
 
     // --- Framework Injection ---
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
-    LOGD("Asking the daemon about '{}'.", nice_name_str.get());
+    const char *nice_name_cstr = nice_name_str.get();
+    if (!nice_name_cstr) {
+        SetAllowUnload(true);
+        return;
+    }
+
+    LOGD("Asking the daemon about '{}'.", nice_name_cstr);
 
     auto &ipc_bridge = IPCBridge::GetInstance();
+    ipc_bridge.Initialize(env_);
     auto binder = ipc_bridge.RequestAppBinder(env_, args->nice_name);
     if (!binder) {
         // Usually because nothing has it in scope, but the daemon may also not be up yet or have
         // registered this process already. Only it knows which, and it logs the reason itself.
-        LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_str.get());
+        LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_cstr);
         SetAllowUnload(true);
         return;
     }
@@ -339,7 +361,7 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // Fetch resources from the manager service.
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, binder.get());
     if (dex_fd < 0) {
-        LOGE("Failed to fetch framework DEX for '{}'.", nice_name_str.get());
+        LOGE("Failed to fetch framework DEX for '{}'.", nice_name_cstr);
         SetAllowUnload(true);
         return;
     }
@@ -363,13 +385,13 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     // Hand off control to the Java side of the framework.
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V",
-        JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(), is_manager_app_);
+        JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get());
 
     if (entered) {
-        LOGV("Injected Vector framework into '{}'.", nice_name_str.get());
+        LOGV("Injected Vector framework into '{}'.", nice_name_cstr);
     } else {
         LOGE("Framework entry failed in '{}'; this process runs without Xposed.",
-             nice_name_str.get());
+             nice_name_cstr);
     }
     // Unconditionally: the ART and JNI hooks were installed before the entry ran, and their
     // trampolines point into this library. Letting it be unloaded now would leave them dangling.
@@ -462,8 +484,7 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     auto system_name = lsplant::ScopedLocalRef(env_, env_->NewStringUTF("system"));
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V",
-        JNI_TRUE, is_late_inject, system_name.get(), nullptr, manager_binder.get(),
-        is_manager_app_);
+        JNI_TRUE, is_late_inject, system_name.get(), nullptr, manager_binder.get());
 
     if (entered) {
         LOGI("Injected Vector framework into system_server.");
