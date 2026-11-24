@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.10)
 
 project(external)
 
+set(CMAKE_CXX_MODULE_STD 0)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CXX_STANDARD 23)
 
 set(XZ_SOURCES
@@ -23,6 +25,9 @@ set(FMT_MODULE OFF CACHE BOOL "Build a module library." FORCE)
 
 add_subdirectory(dobby)
 add_subdirectory(fmt)
+if (TARGET fmt)
+	set_target_properties(fmt PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+endif ()
 add_subdirectory(lsplant/lsplant/src/main/jni)
 target_compile_options(lsplant_static PUBLIC -Wno-gnu-anonymous-struct
 	# lsplant.cc's `operator""_uarr()` is a string literal operator template, which is a GNU
