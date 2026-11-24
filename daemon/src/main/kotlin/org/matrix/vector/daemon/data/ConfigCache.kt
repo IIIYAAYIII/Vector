@@ -93,7 +93,7 @@ object ConfigCache {
             runCatching {
                   val info =
                       packageManager?.getPackageInfoCompat(
-                          BuildConfig.DEFAULT_MANAGER_PACKAGE_NAME, 0, 0)
+                          BuildConfig.DEFAULT_MANAGER_PACKAGE_NAME, MATCH_ALL_FLAGS, 0)
                   val uid = info?.applicationInfo?.uid
                   val installedApkPath = info?.applicationInfo?.sourceDir
                   if (uid == null || installedApkPath == null) {
@@ -101,10 +101,15 @@ object ConfigCache {
                     return@runCatching null
                   }
 
-                  InstallerVerifier.verifyInstallerSignature(installedApkPath)
+                  runCatching {
+                    InstallerVerifier.verifyInstallerSignature(installedApkPath)
+                  }.onFailure { e ->
+                    Log.w(TAG, "InstallerVerifier failed for manager at $installedApkPath: ${e.message}")
+                  }
                   Log.i(TAG, "Manager verified and found at UID: $uid")
                   uid
                 }
+                .onFailure { Log.e(TAG, "Failed to update manager", it) }
                 .getOrNull()
 
     synchronized(this) { state = state.copy(managerUid = resolved ?: -1) }
