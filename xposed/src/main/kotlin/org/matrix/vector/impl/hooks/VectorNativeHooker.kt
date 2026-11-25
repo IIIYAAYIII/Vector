@@ -188,7 +188,7 @@ class VectorNativeHooker<T : Executable>(private val method: T) {
 
         val rootChain = VectorChain(method, thisObject, actualArgs, modernHooks, 0, terminal)
 
-        val result = rootChain.proceed()
+        var result = rootChain.proceed()
 
         // Type safety validation before returning to C++
         if (returnType != null && returnType != Void.TYPE) {
@@ -198,20 +198,43 @@ class VectorNativeHooker<T : Executable>(private val method: T) {
                         "Hook returned null for a primitive return type: $method"
                     )
                 }
-            } else {
-                // Use the JNI bridge for the most reliable type check across ClassLoaders
-                if (
-                    !HookBridge.instanceOf(result, returnType) &&
-                        !isBoxingCompatible(result, returnType)
-                ) {
-                    Utils.logD(
-                        "Hook return type mismatch. Expected ${returnType.name}, got ${result.javaClass.name}"
+            } else if (
+                !HookBridge.instanceOf(result, returnType) &&
+                    !isBoxingCompatible(result, returnType)
+            ) {
+                // Unwrap ParceledListSlice -> List for PMS/ResolveIntent hooks on Android 15/16,
+                // or fall back to the original method so an invalid return never crashes system_server.
+                val coerced = coerceCompatibleReturn(result, returnType)
+                if (coerced != null && HookBridge.instanceOf(coerced, returnType)) {
+                    result = coerced
+                } else {
+                    Utils.logE(
+                        "Hook return type mismatch on $method. Expected ${returnType.name}, got ${result.javaClass.name}; falling back to original."
                     )
+                    return invokeOriginalSafely(thisObject, actualArgs)
                 }
             }
         }
 
         return result
+    }
+
+    /**
+     * Unwraps a `BaseParceledListSlice` (e.g., `ParceledListSlice`) into a `List` when a hooked
+     * method expects `java.util.List` or a compatible interface.
+     */
+    private fun coerceCompatibleReturn(obj: Any, targetType: Class<*>): Any? {
+        if (!List::class.java.isAssignableFrom(targetType)) return null
+        val clsName = obj.javaClass.name
+        val superName = obj.javaClass.superclass?.name
+        if (
+            clsName == "android.content.pm.ParceledListSlice" ||
+                clsName == "android.content.pm.BaseParceledListSlice" ||
+                superName == "android.content.pm.BaseParceledListSlice"
+        ) {
+            return runCatching { obj.javaClass.getMethod("getList").invoke(obj) }.getOrNull()
+        }
+        return null
     }
 
     /** Handles primitive boxing compatibility (e.g., Integer object vs int primitive). */
