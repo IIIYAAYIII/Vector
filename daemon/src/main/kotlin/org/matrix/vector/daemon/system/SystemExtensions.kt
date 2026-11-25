@@ -146,15 +146,18 @@ fun IPackageManager.getPackageInfoWithComponents(
 fun PackageInfo.fetchProcesses(): Set<String> {
   val processNames = mutableSetOf<String>()
 
+  applicationInfo?.processName?.let { processNames.add(it) }
+  packageName?.let { processNames.add(it) }
+
   val componentArrays = arrayOf(activities, receivers, providers)
   for (components in componentArrays) {
-    components?.forEach { processNames.add(it.processName) }
+    components?.forEach { it.processName?.let { name -> processNames.add(name) } }
   }
 
   services?.forEach { service ->
     // Ignore isolated processes as they shouldn't be hooked in the same way
     if ((service.flags and ServiceInfo.FLAG_ISOLATED_PROCESS) == 0) {
-      processNames.add(service.processName)
+      service.processName?.let { processNames.add(it) }
     }
   }
 
